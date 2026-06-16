@@ -1,7 +1,7 @@
 system:
   db_path: ./data/experiments.db
   embedding_model: sentence-transformers/all-MiniLM-L6-v2
-  generation_model: meta-llama/Llama-2-7b-hf
+  generation_model: mistralai/Mistral-7B-Instruct-v0.3
   use_4bit: true
 
 logging:
