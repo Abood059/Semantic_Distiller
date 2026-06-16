@@ -1,0 +1,9 @@
+system:
+  db_path: ./data/experiments.db
+  embedding_model: sentence-transformers/all-MiniLM-L6-v2
+  generation_model: meta-llama/Llama-2-7b-hf
+  use_4bit: true
+
+logging:
+  level: INFO
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"

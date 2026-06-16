@@ -1,0 +1,1279 @@
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+core/
+  services/
+    __init__.py
+    embedding_service.py
+    generation_service.py
+    sampling_service.py
+  storage/
+    __init__.py
+    checkpoint_manager.py
+    db_handler.py
+  __init__.py
+  orchestrator.py
+interface/
+  __init__.py
+  cli_parser.py
+  input_schemas.py
+  output_schemas.py
+  templates_store.py
+config.yaml
+main.py
+Project_plan.txt
+requirements.txt
+run.py
+test_input.json
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path="core/services/__init__.py">
+
+</file>
+
+<file path="core/services/embedding_service.py">
+import logging
+import torch
+from sentence_transformers import SentenceTransformer
+
+
+class EmbeddingService:
+    def __init__(self, model_name: str, device: str = None):
+        """Load SentenceTransformer model for embedding generation."""
+        self.logger = logging.getLogger(__name__)
+        self.model_name = model_name
+        self.device = device if device else ("cuda" if torch.cuda.is_available() else "cpu")
+        self.logger.info(f"Loading embedding model: {model_name} on {self.device}")
+        self.model = SentenceTransformer(model_name, device=self.device)
+    
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        """
+        Generate normalized embeddings for a list of texts.
+        
+        Args:
+            texts: List of text strings to embed
+            
+        Returns:
+            List of embedding vectors (each as list of floats)
+        """
+        with torch.inference_mode():
+            embeddings = self.model.encode(
+                texts,
+                convert_to_numpy=True,
+                normalize_embeddings=True,
+                show_progress_bar=False
+            )
+        return embeddings.tolist()
+    
+    def cleanup(self) -> None:
+        """Optional model cleanup to free memory."""
+        del self.model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        self.logger.info("Embedding service cleaned up")
+</file>
+
+<file path="core/services/generation_service.py">
+import logging
+import torch
+import re
+import json
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+
+
+class GenerationService:
+    def __init__(self, model_name: str, use_4bit: bool = True, **kwargs):
+        """Initialize generation service with quantized model.
+        
+        Args:
+            model_name: HuggingFace model identifier
+            use_4bit: Whether to use 4-bit quantization
+            **kwargs: Additional arguments for model loading
+        """
+        self.logger = logging.getLogger(__name__)
+        self.model_name = model_name
+        self.use_4bit = use_4bit
+        
+        self.logger.info(f"Loading generation model: {model_name}")
+        
+        # Configure 4-bit quantization if requested
+        if use_4bit:
+            bnb_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_use_double_quant=True
+            )
+        else:
+            bnb_config = None
+        
+        # Load model
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            quantization_config=bnb_config,
+            device_map="auto",
+            torch_dtype=torch.bfloat16
+        )
+        
+        # Load tokenizer
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.tokenizer.pad_token = self.tokenizer.eos_token
+        
+        self.logger.info("Generation model loaded successfully")
+    
+    def generate(
+        self,
+        prompt: str,
+        num_sentences: int,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        repetition_penalty: float = 1.1
+    ) -> list[str]:
+        """Generate sentences based on prompt.
+        
+        Args:
+            prompt: Input prompt for generation
+            num_sentences: Number of sentences to generate
+            temperature: Sampling temperature
+            top_p: Nucleus sampling parameter
+            repetition_penalty: Penalty for repetition
+            
+        Returns:
+            List of generated sentences (exactly num_sentences length)
+        """
+        inputs = self.tokenizer(prompt, return_tensors="pt", padding=True, truncation=True)
+        inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
+        
+        with torch.no_grad():
+            outputs = self.model.generate(
+                **inputs,
+                do_sample=True,
+                max_new_tokens=150,
+                temperature=temperature,
+                top_p=top_p,
+                repetition_penalty=repetition_penalty,
+                use_cache=True,
+                pad_token_id=self.tokenizer.eos_token_id
+            )
+        
+        # Decode output
+        generated_text = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+        
+        # Post-process to extract sentences
+        sentences = _post_process_output(generated_text, num_sentences)
+        
+        self.logger.info(f"Generated {len(sentences)} sentences")
+        return sentences
+    
+    def cleanup(self) -> None:
+        """Clean up model and tokenizer to free memory."""
+        del self.model
+        del self.tokenizer
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        self.logger.info("Generation service cleaned up")
+
+
+def _post_process_output(raw_text: str, num_sentences: int) -> list[str]:
+    """Post-process raw generation output to extract sentences.
+    
+    Args:
+        raw_text: Raw text from model generation
+        num_sentences: Expected number of sentences
+        
+    Returns:
+        List of sentences (padded to num_sentences if needed)
+    """
+    # Clean text from common markers
+    cleaned = raw_text
+    for marker in ["[INST]", "[/INST]", "Human:", "Assistant:", "###"]:
+        cleaned = cleaned.replace(marker, "")
+    cleaned = cleaned.strip()
+    
+    sentences = []
+    
+    # Try to extract JSON list first
+    json_match = re.search(r'\[.*?\]', cleaned, re.DOTALL)
+    if json_match:
+        try:
+            sentences = json.loads(json_match.group(0))
+            if isinstance(sentences, list) and all(isinstance(s, str) for s in sentences):
+                if len(sentences) >= num_sentences:
+                    return sentences[:num_sentences]
+        except (json.JSONDecodeError, ValueError):
+            pass
+    
+    # Fallback: extract numbered list
+    numbered_pattern = r'(?:^|\n)\s*(\d+\.|-)\s*([^\n]+)'
+    matches = re.findall(numbered_pattern, cleaned, re.MULTILINE)
+    if matches:
+        sentences = [match[1].strip() for match in matches]
+    
+    # If still no sentences, split by newlines and filter
+    if not sentences:
+        lines = [line.strip() for line in cleaned.split('\n') if line.strip()]
+        sentences = lines
+    
+    # Pad or truncate to exact num_sentences
+    while len(sentences) < num_sentences:
+        sentences.append("")
+    if len(sentences) > num_sentences:
+        sentences = sentences[:num_sentences]
+    
+    return sentences
+</file>
+
+<file path="core/services/sampling_service.py">
+import logging
+import numpy as np
+import faiss
+
+
+class FPSSampler:
+    def __init__(self, metric: str = "cosine"):
+        """Initialize Farthest Point Sampling sampler.
+        
+        Args:
+            metric: Distance metric to use (currently only "cosine" supported)
+        """
+        self.logger = logging.getLogger(__name__)
+        self.metric = metric
+        if metric != "cosine":
+            self.logger.warning(f"Metric '{metric}' not fully supported, using cosine")
+    
+    def select(self, embeddings: list[list[float]], k: int) -> list[int]:
+        """
+        Select k diverse embeddings using Farthest Point Sampling with FAISS.
+        
+        Args:
+            embeddings: List of embedding vectors (each as list of floats)
+            k: Number of samples to select
+            
+        Returns:
+            List of indices of selected embeddings
+            
+        Raises:
+            ValueError: If k > len(embeddings)
+        """
+        if k > len(embeddings):
+            raise ValueError(f"k ({k}) cannot exceed number of embeddings ({len(embeddings)})")
+        
+        if k == 0:
+            return []
+        
+        # Convert to numpy array
+        embeddings_array = np.array(embeddings, dtype=np.float32)
+        
+        # Normalize embeddings for cosine similarity
+        faiss.normalize_L2(embeddings_array)
+        
+        # Build FAISS index for inner product (equivalent to cosine for normalized vectors)
+        index = faiss.IndexFlatIP(embeddings_array.shape[1])
+        index.add(embeddings_array)
+        
+        # Random first point
+        selected_indices = [np.random.randint(len(embeddings))]
+        
+        # Iteratively select farthest points
+        for _ in range(k - 1):
+            # Get similarities of all points to last selected point
+            last_selected = np.array([embeddings_array[selected_indices[-1]]])
+            similarities, _ = index.search(last_selected, len(embeddings))
+            similarities = similarities[0]
+            
+            # For already selected points, set similarity to 1 (minimum distance)
+            similarities[selected_indices] = 1.0
+            
+            # Select point with minimum similarity (maximum distance)
+            next_idx = np.argmin(similarities)
+            selected_indices.append(int(next_idx))
+        
+        self.logger.info(f"Selected {len(selected_indices)} diverse samples from {len(embeddings)} embeddings")
+        return selected_indices
+</file>
+
+<file path="core/storage/__init__.py">
+
+</file>
+
+<file path="core/storage/checkpoint_manager.py">
+import sqlite3
+from .db_handler import DatabaseHandler
+
+
+def is_node_done(db_handler: DatabaseHandler, layer: int, node: int) -> bool:
+    """Check if a node is already completed."""
+    conn = db_handler._get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT COUNT(*) FROM results
+        WHERE layer = ? AND node = ? AND status = 'DONE'
+    """, (layer, node))
+    count = cursor.fetchone()[0]
+    conn.close()
+    return count > 0
+
+
+def mark_node_processing(db_handler: DatabaseHandler, layer: int, node: int) -> None:
+    """Mark a node as processing."""
+    conn = db_handler._get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        UPDATE results
+        SET status = 'PROCESSING'
+        WHERE layer = ? AND node = ?
+    """, (layer, node))
+    conn.commit()
+    conn.close()
+
+
+def reset_failed_nodes(db_handler: DatabaseHandler, layer: int) -> None:
+    """Reset failed nodes from PROCESSING to PENDING."""
+    conn = db_handler._get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        UPDATE results
+        SET status = 'PENDING'
+        WHERE layer = ? AND status = 'PROCESSING'
+    """, (layer,))
+    conn.commit()
+    conn.close()
+</file>
+
+<file path="core/storage/db_handler.py">
+import sqlite3
+from pathlib import Path
+from typing import List
+import numpy as np
+from array import array
+
+
+class DatabaseHandler:
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+    
+    def _get_connection(self) -> sqlite3.Connection:
+        """Get a database connection with WAL mode enabled."""
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        return conn
+    
+    def initialize_db(self) -> None:
+        """Create the results table if it doesn't exist."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS results (
+                layer INTEGER NOT NULL,
+                node INTEGER NOT NULL,
+                sentence_index INTEGER NOT NULL,
+                sentence TEXT NOT NULL,
+                embedding BLOB,
+                status TEXT NOT NULL,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (layer, node, sentence_index)
+            )
+        """)
+        conn.commit()
+        conn.close()
+    
+    def _serialize_embedding(self, embedding_list: List[float]) -> bytes:
+        """Convert embedding list to bytes using array('f')."""
+        arr = array('f', embedding_list)
+        return arr.tobytes()
+    
+    def _deserialize_embedding(self, blob: bytes) -> List[float]:
+        """Convert bytes back to embedding list using numpy."""
+        return np.frombuffer(blob, dtype=np.float32).tolist()
+    
+    def save_node_results(self, layer: int, node: int, sentences: List[str], embeddings: List[List[float]]) -> None:
+        """Save node results to database."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        
+        for idx, (sentence, embedding) in enumerate(zip(sentences, embeddings)):
+            embedding_blob = self._serialize_embedding(embedding)
+            cursor.execute("""
+                INSERT OR REPLACE INTO results 
+                (layer, node, sentence_index, sentence, embedding, status)
+                VALUES (?, ?, ?, ?, ?, 'DONE')
+            """, (layer, node, idx, sentence, embedding_blob))
+        
+        conn.commit()
+        conn.close()
+    
+    def get_inputs_for_node(self, layer: int, node: int, num_nodes: int) -> List[str]:
+        """Get input sentences for a node from the previous layer. # FIXED: Returns ONE sentence per previous node where sentence_index = node - 1."""
+        if layer == 0:
+            return []
+        
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        
+        sentences = []
+        for prev_node in range(num_nodes):
+            cursor.execute("""
+                SELECT sentence FROM results
+                WHERE layer = ? AND node = ? AND sentence_index = ? AND status = 'DONE'
+            """, (layer - 1, prev_node, node - 1))  # FIXED: Use sentence_index = node - 1 to get one specific sentence
+            row = cursor.fetchone()  # FIXED: Use fetchone() instead of fetchall()
+            sentences.append(row[0] if row else "")  # FIXED: Append single sentence or empty string
+        
+        conn.close()
+        return sentences
+</file>
+
+<file path="core/__init__.py">
+
+</file>
+
+<file path="core/orchestrator.py">
+import logging
+import gc
+import torch
+import numpy as np
+from typing import Dict, Any
+from interface.input_schemas import ExperimentInput
+from interface.output_schemas import ExperimentOutput, LayerOutput, NodeOutput
+from interface.templates_store import get_template
+from core.storage.db_handler import DatabaseHandler
+from core.storage.checkpoint_manager import is_node_done
+from core.services.embedding_service import EmbeddingService
+from core.services.generation_service import GenerationService
+from core.services.sampling_service import FPSSampler
+
+
+class SADNOrchestrator:
+    def __init__(
+        self,
+        config: Dict[str, Any],
+        db_handler: DatabaseHandler,
+        embedding_service: EmbeddingService,
+        generation_service: GenerationService,
+        sampler: FPSSampler
+    ):
+        """Initialize the SADN orchestrator.
+        
+        Args:
+            config: System configuration dictionary
+            db_handler: Database handler for persistence
+            embedding_service: Service for generating embeddings
+            generation_service: Service for text generation
+            sampler: Service for diverse sampling
+        """
+        self.logger = logging.getLogger(__name__)
+        self.config = config
+        self.db_handler = db_handler
+        self.embedding_service = embedding_service
+        self.generation_service = generation_service
+        self.sampler = sampler
+    
+    def run(self, request: ExperimentInput) -> ExperimentOutput:
+        """Run the SADN experiment.
+        
+        Args:
+            request: Experiment input parameters
+            
+        Returns:
+            ExperimentOutput with all layer/node results
+        """
+        self.logger.info(f"Starting experiment with {request.num_layers} layers, {request.num_nodes} nodes")
+        
+        # Phase 1: Initial Input Preparation
+        self.logger.info("Phase 1: Initial input preparation")
+        initial_embeddings = self.embedding_service.embed(request.initial_sentence_pool)
+        
+        # Select diverse sentences for layer 1
+        total_needed = request.num_nodes * request.num_output_sentences
+        selected_indices = self.sampler.select(initial_embeddings, total_needed)
+        
+        # Distribute selected sentences to layer 1 nodes
+        layer1_inputs = []
+        for node in range(request.num_nodes):
+            start_idx = node * request.num_output_sentences
+            end_idx = start_idx + request.num_output_sentences
+            node_sentences = [request.initial_sentence_pool[i] for i in selected_indices[start_idx:end_idx]]
+            layer1_inputs.append(node_sentences)
+        
+        # Phase 2: Layer/Node Loop
+        self.logger.info("Phase 2: Layer/Node processing")
+        for layer in range(1, request.num_layers + 1):
+            self.logger.info(f"Processing layer {layer}/{request.num_layers}")
+            
+            for node in range(1, request.num_nodes + 1):
+                self.logger.info(f"Processing layer {layer}, node {node}")
+                
+                # Checkpoint: Skip if already done
+                if request.resume_from_checkpoint and is_node_done(self.db_handler, layer, node):
+                    self.logger.info(f"Skipping layer {layer}, node {node} (already done)")
+                    continue
+                
+                try:
+                    # Fetch inputs
+                    if layer == 1:
+                        input_sentences = layer1_inputs[node - 1]
+                    else:
+                        input_sentences = self.db_handler.get_inputs_for_node(
+                            layer, node, request.num_nodes
+                        )
+                    
+                    # Build prompt
+                    template = get_template(request.prompt_template_id)
+                    numbered_sentences = "\n".join(
+                        [f"{i+1}. {s}" for i, s in enumerate(input_sentences)]
+                    )
+                    prompt = template.format(sentences=numbered_sentences)
+                    
+                    # Generate
+                    generated_texts = self.generation_service.generate(
+                        prompt=prompt,
+                        num_sentences=request.num_output_sentences
+                    )
+                    
+                    # Embed generated texts
+                    generated_embeddings = self.embedding_service.embed(generated_texts)
+                    
+                    # Calculate intra-node diversity (average cosine distance)
+                    intra_diversity = self._calculate_intra_diversity(generated_embeddings)
+                    
+                    # Save results
+                    self.db_handler.save_node_results(
+                        layer=layer,
+                        node=node,
+                        sentences=generated_texts,
+                        embeddings=generated_embeddings
+                    )
+                    
+                    self.logger.info(
+                        f"Completed layer {layer}, node {node} "
+                        f"(intra-diversity: {intra_diversity:.4f})"
+                    )
+                    
+                except Exception as e:
+                    self.logger.error(f"Error in layer {layer}, node {node}: {e}")
+                    # Save error to database and continue
+                    error_text = f"ERROR: {str(e)}"
+                    self.db_handler.save_node_results(
+                        layer=layer,
+                        node=node,
+                        sentences=[error_text] * request.num_output_sentences,
+                        embeddings=[[0.0] * 384] * request.num_output_sentences
+                    )
+                
+                # Memory cleanup
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                gc.collect()
+        
+        # Phase 3: Final Assembly
+        self.logger.info("Phase 3: Final assembly")
+        results = self._assemble_results(request)
+        
+        return results
+    
+    def _calculate_intra_diversity(self, embeddings: list[list[float]]) -> float:
+        """Calculate average cosine distance between all pairs of embeddings.
+        
+        Args:
+            embeddings: List of embedding vectors
+            
+        Returns:
+            Average cosine distance
+        """
+        if len(embeddings) < 2:
+            return 0.0
+        
+        embeddings_array = np.array(embeddings, dtype=np.float32)
+        
+        # Normalize for cosine similarity
+        norms = np.linalg.norm(embeddings_array, axis=1, keepdims=True)
+        embeddings_array = embeddings_array / (norms + 1e-8)
+        
+        # Compute pairwise cosine similarities
+        similarities = embeddings_array @ embeddings_array.T
+        
+        # Convert to distances and average (excluding diagonal)
+        n = len(embeddings)
+        distances = 1.0 - similarities
+        mask = ~np.eye(n, dtype=bool)
+        avg_distance = np.mean(distances[mask])
+        
+        return float(avg_distance)
+    
+    def _assemble_results(self, request: ExperimentInput) -> ExperimentOutput:
+        """Assemble final results from database.
+        
+        Args:
+            request: Original experiment input
+            
+        Returns:
+            ExperimentOutput with all results
+        """
+        layers = []
+        
+        for layer in range(1, request.num_layers + 1):
+            nodes = []
+            layer_embeddings = []
+            
+            for node in range(1, request.num_nodes + 1):
+                # Fetch node results from database
+                conn = self.db_handler._get_connection()
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT sentence, embedding FROM results
+                    WHERE layer = ? AND node = ? AND status = 'DONE'
+                    ORDER BY sentence_index
+                """, (layer, node))
+                rows = cursor.fetchall()
+                conn.close()
+                
+                if rows:
+                    sentences = [row[0] for row in rows]
+                    embeddings = [
+                        self.db_handler._deserialize_embedding(row[1]) for row in rows
+                    ]
+                    layer_embeddings.extend(embeddings)
+                    
+                    # Calculate intra-node diversity
+                    intra_diversity = self._calculate_intra_diversity(embeddings)
+                    
+                    node_output = NodeOutput(
+                        node_id=node,
+                        generated_texts=sentences,
+                        embeddings=embeddings,
+                        intra_node_diversity=intra_diversity
+                    )
+                    nodes.append(node_output)
+            
+            # Calculate layer metrics
+            if layer_embeddings:
+                layer_coverage = self._calculate_layer_coverage(layer_embeddings)
+                layer_bias = self._calculate_layer_bias(layer_embeddings)
+            else:
+                layer_coverage = 0.0
+                layer_bias = None
+            
+            layer_output = LayerOutput(
+                layer_id=layer,
+                nodes=nodes,
+                layer_coverage_score=layer_coverage,
+                layer_bias_vector=layer_bias
+            )
+            layers.append(layer_output)
+        
+        return ExperimentOutput(
+            experiment_id=None,
+            layers=layers,
+            metadata={
+                "num_layers": request.num_layers,
+                "num_nodes": request.num_nodes,
+                "num_output_sentences": request.num_output_sentences,
+                "prompt_template_id": request.prompt_template_id
+            }
+        )
+    
+    def _calculate_layer_coverage(self, embeddings: list[list[float]]) -> float:
+        """Calculate average distance between nodes in a layer.
+        
+        Args:
+            embeddings: All embeddings from the layer
+            
+        Returns:
+            Average distance between node centroids
+        """
+        if not embeddings:
+            return 0.0
+        
+        embeddings_array = np.array(embeddings, dtype=np.float32)
+        
+        # Normalize
+        norms = np.linalg.norm(embeddings_array, axis=1, keepdims=True)
+        embeddings_array = embeddings_array / (norms + 1e-8)
+        
+        # Compute pairwise distances
+        similarities = embeddings_array @ embeddings_array.T
+        distances = 1.0 - similarities
+        
+        # Average all distances
+        n = len(embeddings)
+        mask = ~np.eye(n, dtype=bool)
+        avg_distance = np.mean(distances[mask])
+        
+        return float(avg_distance)
+    
+    def _calculate_layer_bias(self, embeddings: list[list[float]]) -> list[float]:
+        """Calculate centroid (bias vector) of layer embeddings.
+        
+        Args:
+            embeddings: All embeddings from the layer
+            
+        Returns:
+            Centroid vector as list of floats
+        """
+        if not embeddings:
+            return []
+        
+        embeddings_array = np.array(embeddings, dtype=np.float32)
+        centroid = np.mean(embeddings_array, axis=0)
+        
+        return centroid.tolist()
+</file>
+
+<file path="interface/__init__.py">
+
+</file>
+
+<file path="interface/cli_parser.py">
+import json
+import sys
+from pydantic import ValidationError
+from .input_schemas import ExperimentInput
+from .output_schemas import ExperimentOutput
+
+
+def read_experiment_request(json_path: str) -> ExperimentInput:
+    """Load and validate experiment request from JSON file."""
+    with open(json_path, 'r') as f:
+        data = json.load(f)
+    
+    try:
+        return ExperimentInput(**data)
+    except ValidationError as e:
+        print(f"Validation error in {json_path}:")
+        for error in e.errors():
+            field = '.'.join(str(loc) for loc in error['loc'])
+            print(f"  Field '{field}': {error['msg']}")
+        sys.exit(1)
+
+
+def write_experiment_results(output_path: str, results: ExperimentOutput) -> None:
+    """Write experiment results to JSON file."""
+    with open(output_path, 'w') as f:
+        f.write(results.model_dump_json(indent=2))
+</file>
+
+<file path="interface/input_schemas.py">
+from pydantic import BaseModel, Field, field_validator
+from typing import List, Dict, Any, Optional, Literal
+
+
+class ExperimentInput(BaseModel):
+    initial_sentence_pool: List[str] = Field(..., min_length=100)
+    num_layers: int = Field(..., ge=2, le=6)
+    num_nodes: int = Field(..., ge=3, le=10)
+    num_output_sentences: int = Field(..., ge=3, le=7)
+    prompt_template_id: Literal['creative', 'neutral', 'chain_of_thought']
+    resume_from_checkpoint: bool = False
+    config_overrides: Optional[Dict[str, Any]] = None
+    
+    @field_validator('num_output_sentences')
+    @classmethod
+    def validate_output_sentences(cls, v, info):
+        num_nodes = info.data.get('num_nodes', 0)
+        initial_sentence_pool = info.data.get('initial_sentence_pool', [])
+        if num_nodes * v > len(initial_sentence_pool):
+            raise ValueError(
+                f"num_nodes * num_output_sentences ({num_nodes * v}) cannot exceed "
+                f"initial_sentence_pool length ({len(initial_sentence_pool)})"
+            )
+        return v
+</file>
+
+<file path="interface/output_schemas.py">
+from pydantic import BaseModel
+from typing import List, Optional, Dict, Any
+
+
+class NodeOutput(BaseModel):
+    node_id: int
+    generated_texts: List[str]
+    embeddings: List[List[float]]
+    intra_node_diversity: float
+
+
+class LayerOutput(BaseModel):
+    layer_id: int
+    nodes: List[NodeOutput]
+    layer_coverage_score: float
+    layer_bias_vector: Optional[List[float]] = None
+
+
+class ExperimentOutput(BaseModel):
+    experiment_id: Optional[str] = None
+    layers: List[LayerOutput]
+    metadata: Dict[str, Any]
+</file>
+
+<file path="interface/templates_store.py">
+PROMPT_TEMPLATES = {
+    "creative": "Generate creative variations of the following sentences: {sentences}",
+    "neutral": "Generate neutral variations of the following sentences: {sentences}",
+    "chain_of_thought": "Think step by step and generate variations of the following sentences: {sentences}"
+}
+
+
+def get_template(template_id: str) -> str:
+    """Get a prompt template by ID."""
+    if template_id not in PROMPT_TEMPLATES:
+        raise ValueError(f"Unknown template_id: {template_id}. Available: {list(PROMPT_TEMPLATES.keys())}")
+    return PROMPT_TEMPLATES[template_id]
+</file>
+
+<file path="config.yaml">
+system:
+  db_path: ./data/experiments.db
+  embedding_model: sentence-transformers/all-MiniLM-L6-v2
+  generation_model: meta-llama/Llama-2-7b-hf
+  use_4bit: true
+
+logging:
+  level: INFO
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+</file>
+
+<file path="main.py">
+import yaml
+import logging
+import sys
+import argparse
+import gc
+from interface.cli_parser import read_experiment_request, write_experiment_results
+from core.storage.db_handler import DatabaseHandler
+from core.services.embedding_service import EmbeddingService
+from core.services.sampling_service import FPSSampler
+from core.services.generation_service import GenerationService
+from core.orchestrator import SADNOrchestrator
+
+
+def load_system_config(config_path: str = "config.yaml") -> dict:
+    """Load system configuration from YAML file."""
+    with open(config_path, 'r') as f:
+        config = yaml.safe_load(f)
+    return config
+
+
+def setup_logging(config: dict) -> None:
+    """Configure logging from config."""
+    log_config = config.get('logging', {})
+    log_level = getattr(logging, log_config.get('level', 'INFO'))
+    log_format = log_config.get('format', '%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    
+    logging.basicConfig(
+        level=log_level,
+        format=log_format,
+        stream=sys.stdout
+    )
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Semantic Distiller")
+    parser.add_argument("--config", type=str, default="config.yaml", help="Path to config file")
+    parser.add_argument("--input", type=str, required=True, help="Path to input JSON file")
+    parser.add_argument("--output", type=str, required=True, help="Path to output JSON file")
+    args = parser.parse_args()
+    
+    try:
+        config = load_system_config(args.config)
+        setup_logging(config)
+        logger = logging.getLogger(__name__)
+        logger.info("Semantic Distiller initialized successfully")
+        logger.info(f"Input file: {args.input}, Output file: {args.output}")
+        
+        # Read input
+        request = read_experiment_request(args.input)
+        logger.info(f"Loaded experiment request: {request.num_layers} layers, {request.num_nodes} nodes")
+        
+        # Initialize database
+        db_handler = DatabaseHandler(config['system']['db_path'])
+        db_handler.initialize_db()
+        logger.info("Database initialized")
+        
+        # Initialize services
+        embedding_service = EmbeddingService(config['system']['embedding_model'])
+        generation_service = GenerationService(
+            config['system']['generation_model'],
+            config['system']['use_4bit']
+        )
+        sampler = FPSSampler(metric="cosine")
+        logger.info("Services initialized")
+        
+        # Initialize orchestrator
+        orchestrator = SADNOrchestrator(
+            config, db_handler, embedding_service, generation_service, sampler
+        )
+        logger.info("Orchestrator initialized")
+        
+        # Run experiment
+        results = orchestrator.run(request)
+        logger.info("Experiment completed successfully")
+        
+        # Write output
+        write_experiment_results(args.output, results)
+        logger.info(f"Results written to {args.output}")
+        
+    except Exception as e:
+        logger = logging.getLogger(__name__)
+        logger.error(f"Experiment failed: {e}")
+        sys.exit(1)
+</file>
+
+<file path="Project_plan.txt">
+### خطة التنفيذ التفصيلية (6 مراحل)
+
+---
+
+#### المرحلة 0: البنية التحتية الأساسية وإعداد البيئة (Foundation)
+**المدة التقديرية**: يوم واحد  
+**الاعتماديات**: لا شيء  
+**المخرجات**: هيكل المجلدات، بيئة افتراضية، ملف `requirements.txt`، وتحميل التكوين الأساسي.
+
+**المهام التنفيذية**:
+1. إنشاء هيكل المشروع النهائي (`interface/`, `core/`, `core/services/`, `core/storage/`, `configs/`).
+2. إعداد ملف `requirements.txt` بإصدارات دقيقة (PyTorch 2.1+, Transformers 4.36+, bitsandbytes, sentence-transformers, faiss-gpu, pydantic, pyyaml).
+3. كتابة ملف `config.yaml` الأساسي الذي يحتوي فقط على المتغيرات البيئية (مسارات الحفظ، أسماء النماذج) دون معاملات الشبكة (لأنها ستأتي من المدخلات).
+4. إنشاء نقطة الدخول `main.py` الأولية التي تقرأ `config.yaml` فقط وتطبع "System Initialized".
+
+---
+
+#### المرحلة 1: وحدة التعامل مع المدخلات والمخرجات (I/O Module) - *معزولة تماماً عن GPU*
+**المدة التقديرية**: يومين  
+**الاعتماديات**: المرحلة 0  
+**المخرجات**: مكتبة `interface` قابلة للاختبار باستخدام `pytest` دون الحاجة إلى تحميل أي نموذج.
+
+**المهام التنفيذية**:
+1. **تعريف نماذج Pydantic الصارمة**:
+   - كتابة `ExperimentInput` مع قيود (`min_length` للجمل، `Literal` لمعرف القالب، حدود رقمية للطبقات والعقد).
+   - كتابة `ExperimentOutput` مع تعريف متداخل (`LayerOutput` → `NodeOutput`).
+2. **بناء مخزن القوالب الآمن (Templates Store)**:
+   - إنشاء قاموس ثابت يحتوي على 3 قوالب برومبت (`creative`, `neutral`, `chain_of_thought`) مع متغير `{sentences}`.
+   - منع أي إدخال خارجي لتعديل هذه القوالب مباشرة.
+3. **تنفيذ محلل CLI**:
+   - كتابة `cli_parser.py` الذي يقرأ مسار ملف JSON المدخل عبر `argparse`، ويُمرره إلى Pydantic للتحقق، ويُلقي استثناءً واضحاً في حال الخطأ (بدلاً من الانهيار الغامض).
+4. **اختبار الوحدة**: كتابة حالات اختبار ترسل JSON خاطئ (مثل: قوائم فارغة، أعداد طبقات خارجة عن النطاق) وتتأكد من رفضها.
+
+---
+
+#### المرحلة 2: طبقة التخزين ونقاط التفتيش (Storage & Checkpointing)
+**المدة التقديرية**: يومين  
+**الاعتماديات**: المرحلة 0 (لا تعتمد على I/O)  
+**المخرجات**: وحدة `storage` قادرة على إنشاء قاعدة البيانات، وإدراج النصوص والمتجهات (كرقم ثنائي وهمي `mock`)، واسترجاع مدخلات العقد، وإدارة الحالة (`PENDING/DONE`).
+
+**المهام التنفيذية**:
+1. **تهيئة قاعدة البيانات**:
+   - كتابة `db_handler.py` مع دالة `init_db` تنشئ جدول `results` و `metadata` (مع تفعيل `PRAGMA journal_mode=WAL`).
+2. **تسلسل المتجهات (Serialization)**:
+   - كتابة دوال مساعدة `serialize_embedding` و `deserialize_embedding` باستخدام `array('f')` (دون تضمين Numpy بعد، سنستخدم قوائم وهمية في الاختبارات).
+3. **تنفيذ منطق المدخلات (`get_inputs_for_node`)**:
+   - كتابة استعلام SQL دقيق يسترجع الجمل من الطبقة السابقة بناءً على `node_index` الحالي (المنطق الحالي: الجملة رقم `node` من كل عقدة سابقة). وضع `try-except` للتعامل مع البيانات المفقودة.
+4. **نظام نقاط التفتيش (Checkpoint Manager)**:
+   - كتابة دوال `is_node_done(layer, node)` و `mark_node_done(layer, node)` و `mark_node_processing`، بحيث يمكن إعادة تشغيل التجربة من نقطة الانقطاع.
+
+---
+
+#### المرحلة 3: خدمة التضمين واختيار المدخلات (Embedding & Sampling Service)
+**المدة التقديرية**: يومين  
+**الاعتماديات**: المرحلة 2 (لاستقبال البيانات الأولية)  
+**المخرجات**: خدمة `EmbeddingService` تعمل على GPU، وخوارزمية `FPSSampler` تُنتج فهارس الجمل المتباعدة.
+
+**المهام التنفيذية**:
+1. **تحميل نموذج التضمين**:
+   - كتابة كلاس `EmbeddingService` يقوم بتحميل `all-MiniLM-L6-v2` على `cuda` إن وجد.
+   - إضافة دالة `embed` تُعيد `np.ndarray` مع تفعيل `normalize_embeddings=True`.
+2. **تطبيق خوارزمية FPS باستخدام FAISS**:
+   - كتابة كلاس `FPSSampler` الذي يأخذ المصفوفة الناتجة ويُطبق خوارزمية أخذ العينات الأبعد (`maximin`).
+   - التأكد من أن الخوارزمية تعمل لكافّة الأحجام (حتى لو كان عدد العقد المطلوب > عدد الجمل المتاحة، يتم طرح خطأ واضح).
+3. **اختبار التكامل البسيط**: كتابة سكريبت تجريبي يحوّل 100 جملة وهمية إلى متجهات، ويختار 20 منها، ويتأكد من أن الحد الأدنى للمسافة بين المختارات أكبر من عتبة معينة (مثلاً > 0.5).
+
+---
+
+#### المرحلة 4: خدمة التوليد (Generation Service) - *الجزء الأثقل*
+**المدة التقديرية**: 3 أيام (بسبب ضبط التكميم ومنع تسرب الذاكرة)  
+**الاعتماديات**: المرحلة 3 (للاستفادة من دوال التنظيف)  
+**المخرجات**: خدمة `GenerationService` قادرة على تحميل النموذج المُكمّم وتوليد قوائم جمل منسقة.
+
+**المهام التنفيذية**:
+1. **تحميل النموذج مع التكميم 4-bit**:
+   - كتابة دالة تحميل باستخدام `BitsAndBytesConfig` مع إعدادات `nf4` و `bfloat16`.
+   - ربط `tokenizer` وضبط `pad_token` لتجنب التحذيرات.
+2. **تنفيذ منطق التوليد**:
+   - كتابة دالة `generate` تستقبل نص البرومبت النهائي (الذي سيبنيها المنسق لاحقاً).
+   - تمرير معاملات التوليد (`temperature=0.7`, `top_p=0.95`, `repetition_penalty=1.1`).
+3. **دمج معالجة المخرجات (Post-processing)**:
+   - دمج منطق `post_process_output` الموجود في `utils.py` لاستخراج قائمة الجمل من الاستجابة الخام (دعم JSON والقوائم المرقمة).
+4. **إدارة الذاكرة الصارمة**: إضافة دوال `unload` و `cleanup` لتفريغ النموذج من الذاكرة إذا لزم الأمر، وتجربة تشغيل النموذج لـ 10 مرات متتالية للتأكد من عدم حدوث OOM (نفاد الذاكرة).
+
+---
+
+#### المرحلة 5: المُنسق الأساسي ومنطق الشبكة (Core Orchestrator)
+**المدة التقديرية**: 3 أيام  
+**الاعتماديات**: المرحلة 2، 3، 4 (جميع الخدمات جاهزة)  
+**المخرجات**: الكلاس `SADNOrchestrator` الجاهز لتشغيل دورة الشبكة بالكامل على أي مدخلات.
+
+**المهام التنفيذية**:
+1. **بناء دورة المحاكاة الرئيسية**:
+   - تنفيذ حلقة الطبقات (`for layer in range(1, L+1)`) وحلقة العقد (`for node in range(1, N+1)`).
+   - في كل عقدة، استدعاء `db.get_inputs_for_node` (للطبقات > 1) أو استخدام قائمة الجمل الموزعة من FPS.
+2. **بناء البرومبت**:
+   - استدعاء `build_prompt` باستخدام القالب المختار من `template_id` وتمرير قائمة الجمل المدخلة.
+3. **دمج نقاط التفتيش**:
+   - قبل بدء معالجة العقدة، التحقق من `is_node_done`؛ إن كانت `DONE`، تخطيها (مع إمكانية تعطيل هذا الخيار عبر المدخلات).
+4. **حساب المقاييس الأولية**:
+   - بعد توليد كل عقدة، استدعاء `embedding_service` لتضمين المخرجات.
+   - حساب `intra_node_diversity` (متوسط المسافة بين جمل العقدة الواحدة) وتخزينها في جدول `metadata` (حتى لا نضطر لإعادة الحساب لاحقاً).
+5. **التعامل مع الأخطاء**: إذا فشلت عقدة (مثلاً OOM)، يتم تسجيل خطأ في قاعدة البيانات وتستمر العقد التالية (وليس انهيار التجربة بأكملها).
+
+---
+
+#### المرحلة 6: التكامل النهائي ونقطة الدخول الموحدة (Final Integration & Main Entry)
+**المدة التقديرية**: يوم واحد  
+**الاعتماديات**: جميع المراحل السابقة  
+**المخرجات**: `main.py` النهائي الذي يربط I/O بـ Core ويُصدر النتائج النهائية.
+
+**المهام التنفيذية**:
+1. **ربط الوحدات**:
+   - في `main.py`، استدعاء `I/O` لقراءة المدخلات، ثم تمرير الكائن `ExperimentInput` إلى `Orchestrator`، ثم استقبال الكائن `ExperimentOutput` وتمريره إلى `I/O` لكتابته في ملف JSON المطلوب.
+2. **التصدير النهائي من قاعدة البيانات**:
+   - كتابة دالة في `db_handler` لاستعلام جميع جداول `results` و `metadata` وتحويلها إلى هيكل `ExperimentOutput` المطلوب (مع تحويل BLOB إلى قوائم Python).
+3. **اختبار الصحة (Sanity Check)**:
+   - تشغيل تجربة صغيرة (طبقتان، 3 عقد، 3 جمل مخرجة) لضمان تدفق البيانات من المدخلات إلى المخرجات دون أخطاء.
+4. **توثيق التشغيل**: كتابة `README.md` يشرح كيفية تشغيل النظام باستخدام أمر واحد مثل:
+   ```bash
+   python main.py --config config.yaml --input request.json --output results.json
+   ```
+
+---
+
+### خريطة توزيع العمل (التطوير المتوازي)
+
+| الفريق | المسؤولية | المراحل المعنية |
+| :--- | :--- | :--- |
+| **المطور (أ)** | البنية التحتية + I/O + التخزين | المراحل 0، 1، 2 |
+| **المطور (ب)** | خدمات الذكاء الاصطناعي (التضمين، التوليد، FPS) | المراحل 3، 4 |
+| **المطور (ج)** أو (أ+ب) معاً | المنسق والتكامل النهائي | المراحل 5، 6 |
+
+*ملاحظة صارمة*: لا يُسمح للمطور (أ) بالبدء في المرحلة 5 حتى يُنهي المطور (ب) المرحلة 4، ولكن يمكنه كتابة Mock للخدمات لاختبار منطق الشبكة مبكراً.
+
+
+هذه الخطة تمنحك رؤية واضحة لكل خطوة، وتضمن أن كل جزء قابل للاختبار بشكل مستقل، مما يقلل من المخاطر التقنية في المراحل النهائية.
+</file>
+
+<file path="requirements.txt">
+torch>=2.1.0  # FIXED: Updated from 2.0.0 for 4-bit compatibility
+transformers>=4.36.0  # FIXED: Updated from 4.30.0 for 4-bit compatibility
+accelerate>=0.25.0  # FIXED: Updated from 0.20.0 for 4-bit compatibility
+bitsandbytes>=0.41.0
+sentence-transformers>=2.2.0
+faiss-gpu>=1.7.2
+pydantic>=2.0.0
+numpy>=1.24.0
+pyyaml>=6.0
+tqdm>=4.65.0
+</file>
+
+<file path="run.py">
+import sys
+import subprocess
+import os
+from pathlib import Path
+
+
+def main():
+    """Bootstrap script for Semantic Distiller."""
+    project_root = Path(__file__).parent
+    venv_dir = project_root / ".venv"
+    
+    # Create virtual environment if it doesn't exist
+    if not venv_dir.exists():
+        print("Creating virtual environment...")
+        subprocess.run([sys.executable, "-m", "venv", str(venv_dir)], check=True)
+    
+    # Get the python executable in the venv
+    if os.name == 'nt':  # Windows
+        python_exe = venv_dir / "Scripts" / "python.exe"
+        pip_exe = venv_dir / "Scripts" / "pip.exe"
+    else:  # Unix-like
+        python_exe = venv_dir / "bin" / "python"
+        pip_exe = venv_dir / "bin" / "pip"
+    
+    # Upgrade pip
+    print("Upgrading pip...")
+    subprocess.run([str(pip_exe), "install", "--upgrade", "pip"], check=True)
+    
+    # Install dependencies
+    print("Installing dependencies...")
+    subprocess.run([str(pip_exe), "install", "-r", "requirements.txt"], check=True)
+    
+    # Run main.py with all arguments passed through
+    print("Starting Semantic Distiller...")
+    subprocess.run([str(python_exe), "main.py"] + sys.argv[1:], check=True)
+
+
+if __name__ == "__main__":
+    main()
+</file>
+
+<file path="test_input.json">
+{
+  "initial_sentence_pool": [
+    "The quick brown fox jumps over the lazy dog.",
+    "A journey of a thousand miles begins with a single step.",
+    "To be or not to be, that is the question.",
+    "All that glitters is not gold.",
+    "The early bird catches the worm.",
+    "Actions speak louder than words.",
+    "Beauty is in the eye of the beholder.",
+    "Don't count your chickens before they hatch.",
+    "Every cloud has a silver lining.",
+    "Fortune favors the bold.",
+    "Good things come to those who wait.",
+    "Haste makes waste.",
+    "Ignorance is bliss.",
+    "Knowledge is power.",
+    "Laughter is the best medicine.",
+    "Money can't buy happiness.",
+    "No pain, no gain.",
+    "Practice makes perfect.",
+    "Quality over quantity.",
+    "Rome wasn't built in a day.",
+    "Slow and steady wins the race.",
+    "Time flies when you're having fun.",
+    "Unity is strength.",
+    "Variety is the spice of life.",
+    "Where there's a will, there's a way.",
+    "You can't judge a book by its cover.",
+    "A picture is worth a thousand words.",
+    "Barking up the wrong tree.",
+    "Curiosity killed the cat.",
+    "Don't put all your eggs in one basket.",
+    "Every dog has its day.",
+    "Give credit where credit is due.",
+    "Hit the nail on the head.",
+    "If it ain't broke, don't fix it.",
+    "Just do it.",
+    "Keep it simple, stupid.",
+    "Let sleeping dogs lie.",
+    "Make hay while the sun shines.",
+    "Necessity is the mother of invention.",
+    "Once bitten, twice shy.",
+    "Play it by ear.",
+    "Quit while you're ahead.",
+    "Read between the lines.",
+    "Strike while the iron is hot.",
+    "The ball is in your court.",
+    "Under the weather.",
+    "Victory loves preparation.",
+    "When in Rome, do as the Romans do.",
+    "You reap what you sow.",
+    "A friend in need is a friend indeed.",
+    "Better late than never.",
+    "Don't bite the hand that feeds you.",
+    "Easy come, easy go.",
+    "Familiarity breeds contempt.",
+    "Great minds think alike.",
+    "Hope for the best, prepare for the worst.",
+    "It takes two to tango.",
+    "Just because you can, doesn't mean you should.",
+    "Kill two birds with one stone.",
+    "Leave no stone unturned.",
+    "Make the best of a bad situation.",
+    "Never say never.",
+    "One good turn deserves another.",
+    "Put your money where your mouth is.",
+    "Quality over quantity.",
+    "Rome wasn't built in a day.",
+    "See no evil, hear no evil, speak no evil.",
+    "The devil is in the details.",
+    "Under promise, over deliver.",
+    "Variety is the spice of life.",
+    "When the going gets tough, the tough get going.",
+    "You can't have your cake and eat it too.",
+    "A chain is only as strong as its weakest link.",
+    "Bite the bullet.",
+    "Cross that bridge when you come to it.",
+    "Don't cry over spilled milk.",
+    "Every rose has its thorn.",
+    "Fish out of water.",
+    "Get your ducks in a row.",
+    "Have your cake and eat it too.",
+    "If you can't beat them, join them.",
+    "Jump on the bandwagon.",
+    "Keep your chin up.",
+    "Let the chips fall where they may.",
+    "Make a long story short.",
+    "No use crying over spilled milk.",
+    "Once in a blue moon.",
+    "Play your cards right.",
+    "Quality over quantity.",
+    "Rome wasn't built in a day.",
+    "See it to believe it.",
+    "The best things in life are free.",
+    "Under the weather.",
+    "Variety is the spice of life.",
+    "When life gives you lemons, make lemonade.",
+    "You can't make an omelet without breaking eggs.",
+    "A penny saved is a penny earned.",
+    "Better safe than sorry.",
+    "Don't judge a book by its cover.",
+    "Every cloud has a silver lining.",
+    "Fish or cut bait.",
+    "Get out of dodge.",
+    "Have a nice day.",
+    "If you want something done right, do it yourself.",
+    "Just in time.",
+    "Keep your eyes peeled.",
+    "Let bygones be bygones.",
+    "Make no mistake about it."
+  ],
+  "num_layers": 2,
+  "num_nodes": 3,
+  "num_output_sentences": 3,
+  "prompt_template_id": "creative",
+  "resume_from_checkpoint": false
+}
+</file>
+
+</files>
