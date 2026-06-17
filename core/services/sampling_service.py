@@ -1,7 +1,7 @@
 import logging
 import numpy as np
 import faiss
-
+import time
 
 class FPSSampler:
     def __init__(self, metric: str = "cosine"):
@@ -46,8 +46,8 @@ class FPSSampler:
         index.add(embeddings_array)
         
         # Random first point
-        selected_indices = [np.random.randint(len(embeddings))]
-        
+        np.random.seed(int(time.time() * 1000) % 2**32)
+        selected_indices = [np.random.randint(len(embeddings))]        
         # Iteratively select farthest points
         for _ in range(k - 1):
             # Get similarities of all points to last selected point
