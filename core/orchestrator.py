@@ -111,7 +111,8 @@ class SADNOrchestrator:
                         layer=layer,
                         node=node,
                         sentences=generated_texts,
-                        embeddings=generated_embeddings
+                        embeddings=generated_embeddings,
+                        intra_diversity=intra_diversity
                     )
                     
                     self.logger.info(
@@ -127,7 +128,8 @@ class SADNOrchestrator:
                         layer=layer,
                         node=node,
                         sentences=[error_text] * request.num_output_sentences,
-                        embeddings=[[0.0] * 384] * request.num_output_sentences
+                        embeddings=[[0.0] * 384] * request.num_output_sentences,
+                        intra_diversity=0.0
                     )
                 
                 # Memory cleanup
@@ -183,14 +185,15 @@ class SADNOrchestrator:
         
         for layer in range(1, request.num_layers + 1):
             nodes = []
-            layer_embeddings = []
+            # FIXED: Use node centroids instead of all embeddings for layer coverage
+            node_centroids = []
             
             for node in range(1, request.num_nodes + 1):
                 # Fetch node results from database
                 conn = self.db_handler._get_connection()
                 cursor = conn.cursor()
                 cursor.execute("""
-                    SELECT sentence, embedding FROM results
+                    SELECT sentence, embedding, intra_diversity FROM results
                     WHERE layer = ? AND node = ? AND status = 'DONE'
                     ORDER BY sentence_index
                 """, (layer, node))
@@ -202,10 +205,16 @@ class SADNOrchestrator:
                     embeddings = [
                         self.db_handler._deserialize_embedding(row[1]) for row in rows
                     ]
-                    layer_embeddings.extend(embeddings)
+                    # FIXED: Calculate node centroid instead of extending all embeddings
+                    centroid = np.mean(embeddings, axis=0).tolist()
+                    node_centroids.append(centroid)
                     
-                    # Calculate intra-node diversity
-                    intra_diversity = self._calculate_intra_diversity(embeddings)
+                    # FIXED: Read intra_diversity from database instead of recalculating
+                    intra_diversity = rows[0][2]  # Get intra_diversity from first row
+                    if intra_diversity is None:
+                        # Fallback for old data without intra_diversity
+                        self.logger.warning(f"Layer {layer}, node {node}: intra_diversity is None, recalculating")
+                        intra_diversity = self._calculate_intra_diversity(embeddings)
                     
                     node_output = NodeOutput(
                         node_id=node,
@@ -216,9 +225,9 @@ class SADNOrchestrator:
                     nodes.append(node_output)
             
             # Calculate layer metrics
-            if layer_embeddings:
-                layer_coverage = self._calculate_layer_coverage(layer_embeddings)
-                layer_bias = self._calculate_layer_bias(layer_embeddings)
+            if node_centroids:
+                layer_coverage = self._calculate_layer_coverage(node_centroids)
+                layer_bias = self._calculate_layer_bias(node_centroids)
             else:
                 layer_coverage = 0.0
                 layer_bias = None
@@ -242,30 +251,31 @@ class SADNOrchestrator:
             }
         )
     
-    def _calculate_layer_coverage(self, embeddings: list[list[float]]) -> float:
+    def _calculate_layer_coverage(self, centroids: list[list[float]]) -> float:
         """Calculate average distance between nodes in a layer.
         
         Args:
-            embeddings: All embeddings from the layer
+            centroids: Node centroids for the layer
             
         Returns:
             Average distance between node centroids
         """
-        if not embeddings:
+        # FIXED: Check for fewer than 2 centroids
+        if len(centroids) < 2:
             return 0.0
         
-        embeddings_array = np.array(embeddings, dtype=np.float32)
+        centroids_array = np.array(centroids, dtype=np.float32)
         
         # Normalize
-        norms = np.linalg.norm(embeddings_array, axis=1, keepdims=True)
-        embeddings_array = embeddings_array / (norms + 1e-8)
+        norms = np.linalg.norm(centroids_array, axis=1, keepdims=True)
+        centroids_array = centroids_array / (norms + 1e-8)
         
         # Compute pairwise distances
-        similarities = embeddings_array @ embeddings_array.T
+        similarities = centroids_array @ centroids_array.T
         distances = 1.0 - similarities
         
         # Average all distances
-        n = len(embeddings)
+        n = len(centroids)
         mask = ~np.eye(n, dtype=bool)
         avg_distance = np.mean(distances[mask])
         

@@ -28,6 +28,7 @@ class DatabaseHandler:
                 sentence_index INTEGER NOT NULL,
                 sentence TEXT NOT NULL,
                 embedding BLOB,
+                intra_diversity REAL,
                 status TEXT NOT NULL,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (layer, node, sentence_index)
@@ -45,7 +46,7 @@ class DatabaseHandler:
         """Convert bytes back to embedding list using numpy."""
         return np.frombuffer(blob, dtype=np.float32).tolist()
     
-    def save_node_results(self, layer: int, node: int, sentences: List[str], embeddings: List[List[float]]) -> None:
+    def save_node_results(self, layer: int, node: int, sentences: List[str], embeddings: List[List[float]], intra_diversity: float) -> None:
         """Save node results to database."""
         conn = self._get_connection()
         cursor = conn.cursor()
@@ -54,9 +55,9 @@ class DatabaseHandler:
             embedding_blob = self._serialize_embedding(embedding)
             cursor.execute("""
                 INSERT OR REPLACE INTO results 
-                (layer, node, sentence_index, sentence, embedding, status)
-                VALUES (?, ?, ?, ?, ?, 'DONE')
-            """, (layer, node, idx, sentence, embedding_blob))
+                (layer, node, sentence_index, sentence, embedding, intra_diversity, status)
+                VALUES (?, ?, ?, ?, ?, ?, 'DONE')
+            """, (layer, node, idx, sentence, embedding_blob, intra_diversity))
         
         conn.commit()
         conn.close()

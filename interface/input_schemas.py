@@ -21,4 +21,9 @@ class ExperimentInput(BaseModel):
                 f"num_nodes * num_output_sentences ({num_nodes * v}) cannot exceed "
                 f"initial_sentence_pool length ({len(initial_sentence_pool)})"
             )
+        # FIXED: Validate that num_nodes == num_output_sentences for semantic mixing
+        if num_nodes != v:
+            raise ValueError(
+                f"num_nodes ({num_nodes}) must equal num_output_sentences ({v}) for semantic mixing to work correctly."
+            )
         return v

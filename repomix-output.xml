@@ -58,11 +58,13 @@ interface/
   input_schemas.py
   output_schemas.py
   templates_store.py
+.gitignore
 config.yaml
 main.py
 Project_plan.txt
 requirements.txt
 run.py
+setup_and_run.py
 test_input.json
 </directory_structure>
 
@@ -413,6 +415,7 @@ class DatabaseHandler:
                 sentence_index INTEGER NOT NULL,
                 sentence TEXT NOT NULL,
                 embedding BLOB,
+                intra_diversity REAL,
                 status TEXT NOT NULL,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (layer, node, sentence_index)
@@ -430,7 +433,7 @@ class DatabaseHandler:
         """Convert bytes back to embedding list using numpy."""
         return np.frombuffer(blob, dtype=np.float32).tolist()
     
-    def save_node_results(self, layer: int, node: int, sentences: List[str], embeddings: List[List[float]]) -> None:
+    def save_node_results(self, layer: int, node: int, sentences: List[str], embeddings: List[List[float]], intra_diversity: float) -> None:
         """Save node results to database."""
         conn = self._get_connection()
         cursor = conn.cursor()
@@ -439,9 +442,9 @@ class DatabaseHandler:
             embedding_blob = self._serialize_embedding(embedding)
             cursor.execute("""
                 INSERT OR REPLACE INTO results 
-                (layer, node, sentence_index, sentence, embedding, status)
-                VALUES (?, ?, ?, ?, ?, 'DONE')
-            """, (layer, node, idx, sentence, embedding_blob))
+                (layer, node, sentence_index, sentence, embedding, intra_diversity, status)
+                VALUES (?, ?, ?, ?, ?, ?, 'DONE')
+            """, (layer, node, idx, sentence, embedding_blob, intra_diversity))
         
         conn.commit()
         conn.close()
@@ -585,7 +588,8 @@ class SADNOrchestrator:
                         layer=layer,
                         node=node,
                         sentences=generated_texts,
-                        embeddings=generated_embeddings
+                        embeddings=generated_embeddings,
+                        intra_diversity=intra_diversity
                     )
                     
                     self.logger.info(
@@ -601,7 +605,8 @@ class SADNOrchestrator:
                         layer=layer,
                         node=node,
                         sentences=[error_text] * request.num_output_sentences,
-                        embeddings=[[0.0] * 384] * request.num_output_sentences
+                        embeddings=[[0.0] * 384] * request.num_output_sentences,
+                        intra_diversity=0.0
                     )
                 
                 # Memory cleanup
@@ -657,14 +662,15 @@ class SADNOrchestrator:
         
         for layer in range(1, request.num_layers + 1):
             nodes = []
-            layer_embeddings = []
+            # FIXED: Use node centroids instead of all embeddings for layer coverage
+            node_centroids = []
             
             for node in range(1, request.num_nodes + 1):
                 # Fetch node results from database
                 conn = self.db_handler._get_connection()
                 cursor = conn.cursor()
                 cursor.execute("""
-                    SELECT sentence, embedding FROM results
+                    SELECT sentence, embedding, intra_diversity FROM results
                     WHERE layer = ? AND node = ? AND status = 'DONE'
                     ORDER BY sentence_index
                 """, (layer, node))
@@ -676,10 +682,16 @@ class SADNOrchestrator:
                     embeddings = [
                         self.db_handler._deserialize_embedding(row[1]) for row in rows
                     ]
-                    layer_embeddings.extend(embeddings)
+                    # FIXED: Calculate node centroid instead of extending all embeddings
+                    centroid = np.mean(embeddings, axis=0).tolist()
+                    node_centroids.append(centroid)
                     
-                    # Calculate intra-node diversity
-                    intra_diversity = self._calculate_intra_diversity(embeddings)
+                    # FIXED: Read intra_diversity from database instead of recalculating
+                    intra_diversity = rows[0][2]  # Get intra_diversity from first row
+                    if intra_diversity is None:
+                        # Fallback for old data without intra_diversity
+                        self.logger.warning(f"Layer {layer}, node {node}: intra_diversity is None, recalculating")
+                        intra_diversity = self._calculate_intra_diversity(embeddings)
                     
                     node_output = NodeOutput(
                         node_id=node,
@@ -690,9 +702,9 @@ class SADNOrchestrator:
                     nodes.append(node_output)
             
             # Calculate layer metrics
-            if layer_embeddings:
-                layer_coverage = self._calculate_layer_coverage(layer_embeddings)
-                layer_bias = self._calculate_layer_bias(layer_embeddings)
+            if node_centroids:
+                layer_coverage = self._calculate_layer_coverage(node_centroids)
+                layer_bias = self._calculate_layer_bias(node_centroids)
             else:
                 layer_coverage = 0.0
                 layer_bias = None
@@ -716,30 +728,31 @@ class SADNOrchestrator:
             }
         )
     
-    def _calculate_layer_coverage(self, embeddings: list[list[float]]) -> float:
+    def _calculate_layer_coverage(self, centroids: list[list[float]]) -> float:
         """Calculate average distance between nodes in a layer.
         
         Args:
-            embeddings: All embeddings from the layer
+            centroids: Node centroids for the layer
             
         Returns:
             Average distance between node centroids
         """
-        if not embeddings:
+        # FIXED: Check for fewer than 2 centroids
+        if len(centroids) < 2:
             return 0.0
         
-        embeddings_array = np.array(embeddings, dtype=np.float32)
+        centroids_array = np.array(centroids, dtype=np.float32)
         
         # Normalize
-        norms = np.linalg.norm(embeddings_array, axis=1, keepdims=True)
-        embeddings_array = embeddings_array / (norms + 1e-8)
+        norms = np.linalg.norm(centroids_array, axis=1, keepdims=True)
+        centroids_array = centroids_array / (norms + 1e-8)
         
         # Compute pairwise distances
-        similarities = embeddings_array @ embeddings_array.T
+        similarities = centroids_array @ centroids_array.T
         distances = 1.0 - similarities
         
         # Average all distances
-        n = len(embeddings)
+        n = len(centroids)
         mask = ~np.eye(n, dtype=bool)
         avg_distance = np.mean(distances[mask])
         
@@ -820,6 +833,11 @@ class ExperimentInput(BaseModel):
                 f"num_nodes * num_output_sentences ({num_nodes * v}) cannot exceed "
                 f"initial_sentence_pool length ({len(initial_sentence_pool)})"
             )
+        # FIXED: Validate that num_nodes == num_output_sentences for semantic mixing
+        if num_nodes != v:
+            raise ValueError(
+                f"num_nodes ({num_nodes}) must equal num_output_sentences ({v}) for semantic mixing to work correctly."
+            )
         return v
 </file>
 
@@ -863,16 +881,8 @@ def get_template(template_id: str) -> str:
     return PROMPT_TEMPLATES[template_id]
 </file>
 
-<file path="config.yaml">
-system:
-  db_path: ./data/experiments.db
-  embedding_model: sentence-transformers/all-MiniLM-L6-v2
-  generation_model: meta-llama/Llama-2-7b-hf
-  use_4bit: true
+<file path=".gitignore">
 
-logging:
-  level: INFO
-  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 </file>
 
 <file path="main.py">
@@ -1274,6 +1284,213 @@ if __name__ == "__main__":
   "prompt_template_id": "creative",
   "resume_from_checkpoint": false
 }
+</file>
+
+<file path="config.yaml">
+system:
+  db_path: ./data/experiments.db
+  embedding_model: sentence-transformers/all-MiniLM-L6-v2
+  generation_model: mistralai/Mistral-7B-Instruct-v0.3
+  use_4bit: true
+
+logging:
+  level: INFO
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+</file>
+
+<file path="setup_and_run.py">
+#!/usr/bin/env python3
+"""
+Semantic Distiller - Auto Setup & Run Script
+يقوم بسحب الكود من GitHub، تجهيز البيئة، وتشغيل المشروع.
+"""
+
+import os
+import sys
+import subprocess
+import shutil
+from pathlib import Path
+
+# ====== الإعدادات ======
+REPO_URL = "https://github.com/Abood059/Semantic_Distiller.git"
+REPO_DIR = "Semantic_Distiller"
+CONFIG_FILE = "config.yaml"
+INPUT_FILE = "test_input.json"
+OUTPUT_FILE = "results.json"
+
+# ====== الألوان للطباعة ======
+GREEN = "\033[92m"
+YELLOW = "\033[93m"
+RED = "\033[91m"
+BLUE = "\033[94m"
+RESET = "\033[0m"
+
+def print_step(msg):
+    print(f"\n{BLUE}▶ {msg}{RESET}")
+
+def print_success(msg):
+    print(f"{GREEN}✓ {msg}{RESET}")
+
+def print_error(msg):
+    print(f"{RED}✗ {msg}{RESET}")
+
+def print_info(msg):
+    print(f"{YELLOW}ℹ {msg}{RESET}")
+
+def run_command(cmd, cwd=None, check=True):
+    """تشغيل أمر في السطر وأرجاع الناتج."""
+    print_info(f"تنفيذ: {' '.join(cmd) if isinstance(cmd, list) else cmd}")
+    result = subprocess.run(cmd, cwd=cwd, shell=isinstance(cmd, str), 
+                           capture_output=True, text=True)
+    if result.returncode != 0 and check:
+        print_error(f"فشل الأمر: {result.stderr}")
+        sys.exit(1)
+    return result
+
+def main():
+    print(f"{GREEN}{'='*60}{RESET}")
+    print(f"{GREEN}   Semantic Distiller - التشغيل التلقائي{RESET}")
+    print(f"{GREEN}{'='*60}{RESET}")
+
+    # 1. التحقق من وجود Git
+    print_step("التحقق من وجود Git...")
+    if shutil.which("git") is None:
+        print_error("Git غير مثبت. يرجى تثبيت Git أولاً.")
+        print_info("في Ubuntu/Debian: sudo apt install git")
+        print_info("في Colab: !apt-get install git")
+        sys.exit(1)
+    print_success("Git موجود.")
+
+    # 2. سحب الكود من GitHub
+    print_step(f"سحب الكود من {REPO_URL}...")
+    if Path(REPO_DIR).exists():
+        print_info(f"المجلد {REPO_DIR} موجود بالفعل. جارٍ تحديثه...")
+        run_command(["git", "pull"], cwd=REPO_DIR)
+    else:
+        run_command(["git", "clone", REPO_URL])
+    print_success("تم سحب الكود بنجاح.")
+
+    # 3. الدخول إلى المجلد
+    os.chdir(REPO_DIR)
+    print_info(f"الدخول إلى: {os.getcwd()}")
+
+    # 4. التحقق من وجود ملفات المشروع الأساسية
+    print_step("التحقق من ملفات المشروع...")
+    required_files = ["main.py", "run.py", "requirements.txt", "config.yaml"]
+    for f in required_files:
+        if not Path(f).exists():
+            print_error(f"الملف {f} غير موجود في المستودع!")
+            sys.exit(1)
+    print_success("جميع الملفات الأساسية موجودة.")
+
+    # 5. إنشاء البيئة الافتراضية
+    print_step("إنشاء البيئة الافتراضية...")
+    venv_dir = Path(".venv")
+    if not venv_dir.exists():
+        run_command([sys.executable, "-m", "venv", str(venv_dir)])
+        print_success("تم إنشاء البيئة الافتراضية.")
+    else:
+        print_info("البيئة الافتراضية موجودة بالفعل.")
+
+    # 6. تحديد مسار Python و pip داخل البيئة الافتراضية
+    if sys.platform == "win32":
+        python_exe = venv_dir / "Scripts" / "python.exe"
+        pip_exe = venv_dir / "Scripts" / "pip.exe"
+    else:
+        python_exe = venv_dir / "bin" / "python"
+        pip_exe = venv_dir / "bin" / "pip"
+
+    if not python_exe.exists():
+        print_error(f"لم يتم العثور على Python في البيئة الافتراضية: {python_exe}")
+        sys.exit(1)
+
+    # 7. تثبيت التبعيات
+    print_step("تثبيت التبعيات (قد يستغرق عدة دقائق)...")
+    run_command([str(pip_exe), "install", "--upgrade", "pip"])
+    run_command([str(pip_exe), "install", "-r", "requirements.txt"])
+    print_success("تم تثبيت جميع التبعيات.")
+
+    # 8. التحقق من ملف الإدخال
+    print_step("التحقق من ملف الإدخال...")
+    if not Path(INPUT_FILE).exists():
+        print_info(f"ملف {INPUT_FILE} غير موجود. سيتم إنشاء ملف افتراضي.")
+        # إنشاء ملف إدخال بسيط
+        import json
+        sample_input = {
+            "initial_sentence_pool": [
+                "The quick brown fox jumps over the lazy dog.",
+                "A journey of a thousand miles begins with a single step.",
+                "To be or not to be, that is the question.",
+                "All that glitters is not gold.",
+                "The early bird catches the worm.",
+                "Actions speak louder than words.",
+                "Beauty is in the eye of the beholder.",
+                "Don't count your chickens before they hatch.",
+                "Every cloud has a silver lining.",
+                "Fortune favors the bold.",
+                "Good things come to those who wait.",
+                "Haste makes waste.",
+                "Ignorance is bliss.",
+                "Knowledge is power.",
+                "Laughter is the best medicine.",
+                "Money can't buy happiness.",
+                "No pain, no gain.",
+                "Practice makes perfect.",
+                "Quality over quantity.",
+                "Rome wasn't built in a day."
+            ],
+            "num_layers": 2,
+            "num_nodes": 3,
+            "num_output_sentences": 3,
+            "prompt_template_id": "creative",
+            "resume_from_checkpoint": False
+        }
+        with open(INPUT_FILE, "w") as f:
+            json.dump(sample_input, f, indent=2)
+        print_success(f"تم إنشاء {INPUT_FILE} بنجاح.")
+    else:
+        print_success(f"ملف {INPUT_FILE} موجود.")
+
+    # 9. تشغيل المشروع
+    print_step(f"تشغيل المشروع...")
+    print_info(f"الإدخال: {INPUT_FILE}")
+    print_info(f"الإخراج: {OUTPUT_FILE}")
+    print_info("قد يستغرق التشغيل عدة دقائق (تحميل النماذج)...")
+
+    cmd = [
+        str(python_exe), "main.py",
+        "--config", CONFIG_FILE,
+        "--input", INPUT_FILE,
+        "--output", OUTPUT_FILE
+    ]
+    
+    try:
+        result = subprocess.run(cmd, check=True)
+        print_success("تم تشغيل المشروع بنجاح!")
+    except subprocess.CalledProcessError as e:
+        print_error(f"فشل تشغيل المشروع: {e}")
+        sys.exit(1)
+
+    # 10. عرض النتيجة
+    print_step("عرض النتيجة...")
+    if Path(OUTPUT_FILE).exists():
+        import json
+        with open(OUTPUT_FILE, "r") as f:
+            data = json.load(f)
+        layers = data.get("layers", [])
+        print_info(f"عدد الطبقات: {len(layers)}")
+        for layer in layers:
+            print_info(f"  الطبقة {layer.get('layer_id')}: {len(layer.get('nodes', []))} عقد")
+        print_success(f"النتائج محفوظة في: {OUTPUT_FILE}")
+    else:
+        print_error(f"ملف النتائج {OUTPUT_FILE} لم يتم إنشاؤه.")
+
+    print(f"\n{GREEN}{'='*60}{RESET}")
+    print(f"{GREEN}✅ اكتمل التشغيل بنجاح!{RESET}")
+    print(f"{GREEN}{'='*60}{RESET}")
+
+if __name__ == "__main__":
+    main()
 </file>
 
 </files>
